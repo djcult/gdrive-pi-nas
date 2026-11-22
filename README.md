@@ -153,6 +153,75 @@ sudo systemctl enable --now "$unit"
 
 From the laptop, use `ssh -L 8385:127.0.0.1:8384 PI_LOGIN@pinas` and open `http://localhost:8385` for the Pi's Syncthing interface. Pair the two devices. Share the laptop Projects folder as **Send Only**. Accept it on the Pi at `/mnt/nasdata/laptop-projects` as **Receive Only** and enable **Staggered File Versioning** there. Current files, retained versions and the rclone cache share the SSD’s free space. This folder is outside the Drive mount and Samba share.
 
+## Back up the streamer to the NAS over NFS
+
+The streamer writes its raspiBackup system backups to a dedicated directory on the NAS SSD. The existing Samba share continues to serve the Google Drive archive. Reserve a LAN IP for each Pi in DHCP. Replace `STREAMER_IP` and `NAS_IP` below with those addresses.
+
+### On the Pi NAS
+
+Install the server and create the private backup directory while the SSD is mounted.
+
+```bash
+sudo apt install nfs-kernel-server
+findmnt --mountpoint /mnt/nasdata
+mountpoint -q /mnt/nasdata && sudo install -d -m 0700 -o root -g root /mnt/nasdata/pi-backups/streamer
+sudoedit /etc/exports.d/pinas.exports
+```
+
+Add this line, substituting only the streamer's reserved IP. The `mountpoint` option requires the SSD mount before Linux exports the folder. The trusted streamer's root account needs `no_root_squash` to preserve Linux ownership in an rsync backup. Keep this export restricted to that host on the trusted LAN.
+
+```text
+/mnt/nasdata/pi-backups/streamer STREAMER_IP(rw,sync,no_subtree_check,no_root_squash,mountpoint=/mnt/nasdata)
+```
+
+```bash
+sudo systemctl enable --now nfs-kernel-server
+sudo exportfs -rav
+sudo exportfs -v
+```
+
+Check that the listing shows the streamer directory and its single allowed client. If the SSD was missing when exports were loaded, remount it and repeat the two `exportfs` commands.
+
+### On the streamer
+
+Install the client and create its mount point.
+
+```bash
+sudo apt install nfs-common
+sudo mkdir -p /mnt/pinas-backup
+sudoedit /etc/fstab
+```
+
+Append the following line using the NAS IP. The automount lets the streamer boot while the NAS is offline and connects on first access.
+
+```fstab
+NAS_IP:/mnt/nasdata/pi-backups/streamer /mnt/pinas-backup nfs rw,vers=4,hard,_netdev,nofail,x-systemd.automount 0 0
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start "$(systemd-escape --path --suffix=automount /mnt/pinas-backup)"
+sudo ls -A /mnt/pinas-backup >/dev/null
+findmnt --mountpoint /mnt/pinas-backup --types nfs,nfs4
+```
+
+Confirm the source is the NAS export. Test file creation and hard links with a temporary directory before selecting **rsync** and **`/mnt/pinas-backup`** in raspiBackup.
+
+```bash
+sudo bash -e <<'EOF'
+findmnt -rn --mountpoint /mnt/pinas-backup --types nfs,nfs4 >/dev/null
+probe=$(mktemp -d /mnt/pinas-backup/.nfs-check.XXXXXX)
+trap 'rm -f "$probe/link" "$probe/file"; rmdir "$probe"' EXIT
+touch "$probe/file"
+ln "$probe/file" "$probe/link"
+stat -c '%i %h %n' "$probe/file" "$probe/link"
+EOF
+```
+
+Both entries should have the same inode number and a link count of 2. After the first backup, check the dated backup directory on the NAS under `/mnt/nasdata/pi-backups/streamer`. For the NAS's own boot-card backup, use a separate local SSD directory such as `/mnt/nasdata/pi-backups/pinas`.
+
+[raspiBackup NFS guidance](https://framps.github.io/raspiBackupDoc/nfs-as-backuptarget.html) · [Linux NFS export options](https://man7.org/linux/man-pages/man5/exports.5.html)
+
 ## Verify and recover
 
 1. After reboot, check both `/mnt/nasdata` and `/srv/nas` with `findmnt --mountpoint PATH` for each. Check `systemctl status pinas-rclone smbd "syncthing@$(id -un)"`.
