@@ -6,7 +6,7 @@ Build and recovery notes for Raspberry Pi OS Lite on a separate boot device and 
 |---|---|---|
 | NAS archive | Existing Google Drive folder mounted at `/srv/nas` | Windows Samba share `\\nas\nas` and read-only NFS at `/mnt/nas` on the streamer |
 | rclone VFS cache | `/mnt/nasdata/rclone-cache` | Private to the Pi |
-| Laptop projects and retained versions | `/mnt/nasdata/laptop-projects` | Syncthing between laptop and Pi |
+| Windows profile backup and retained versions | `/mnt/nasdata/syncthing/dframe` | Syncthing from Windows (Send Only) to Pi (Receive Only), LAN only |
 
 The archive streams from Drive. The cache holds recently accessed data and can temporarily hold the only copy of pending uploads.
 
@@ -71,12 +71,12 @@ Confirm the mounted filesystem matches the SSD before creating its subdirectorie
 
 ```bash
 mountpoint -q /mnt/nasdata && sudo install -d -m 700 /mnt/nasdata/rclone-cache
-mountpoint -q /mnt/nasdata && sudo install -d -m 700 -o "$(id -un)" -g "$(id -gn)" /mnt/nasdata/laptop-projects
+mountpoint -q /mnt/nasdata && sudo install -d -m 700 -o "$(id -un)" -g "$(id -gn)" /mnt/nasdata/syncthing/dframe
 ```
 
 ## Mount one fixed Google Drive folder
 
-This system service uses a root-owned config. Run `sudo -H rclone config`, add a Google Drive remote named `gdrive`, and complete authorisation. On a headless Pi, answer **no** to browser-based authentication and run the exact `rclone authorize ...` command shown by the Pi in an existing Windows PowerShell session with rclone installed. Finish Google sign-in in the browser, then return to **PowerShell** for the JSON token printed between markers; paste the complete token at the Pi's `config_token>` prompt. If a separate console window closes too quickly, run the command directly in an existing PowerShell window rather than double-clicking a shortcut. Never commit the token, client secret or `rclone.conf` to Git. For a personal NAS containing ordinary files, consider the Drive advanced option `skip_gdocs = true` to hide Google-native Docs/Sheets/Slides from the filesystem without deleting them from Drive. Keep the resulting config private. The example below assumes an existing folder named `NAS` in My Drive. Set the remote path and cache target before installing the service. Choose a cache target that leaves room for laptop projects and their version history. Open files and pending uploads can temporarily push the cache above its target. Check available space with `df -h /mnt/nasdata`.
+This system service uses a root-owned config. Run `sudo -H rclone config`, add a Google Drive remote named `gdrive`, and complete authorisation. On a headless Pi, answer **no** to browser-based authentication and run the exact `rclone authorize ...` command shown by the Pi in an existing Windows PowerShell session with rclone installed. Finish Google sign-in in the browser, then return to **PowerShell** for the JSON token printed between markers; paste the complete token at the Pi's `config_token>` prompt. If a separate console window closes too quickly, run the command directly in an existing PowerShell window rather than double-clicking a shortcut. Never commit the token, client secret or `rclone.conf` to Git. For a personal NAS containing ordinary files, consider the Drive advanced option `skip_gdocs = true` to hide Google-native Docs/Sheets/Slides from the filesystem without deleting them from Drive. Keep the resulting config private. The example below assumes an existing folder named `NAS` in My Drive. Set the remote path and cache target before installing the service. Choose a cache target that leaves room for the Windows profile backup and its version history. Open files and pending uploads can temporarily push the cache above its target. Check available space with `df -h /mnt/nasdata`.
 
 ```bash
 sudo -H rclone lsf 'gdrive:NAS' --max-depth 1
@@ -179,7 +179,7 @@ To undo: run `subst G: /D`, disable or delete the scheduled task, and remove the
 
 ## Read the same archive over NFS on the streamer
 
-Samba writes to the Drive folder configured by `DRIVE_PATH`. A second rclone service reads that same remote for playback. A file added through Windows becomes visible on the streamer after upload and directory-cache refresh. Syncthing projects stay on the local SSD.
+Samba writes to the Drive folder configured by `DRIVE_PATH`. A second rclone service reads that same remote for playback. A file added through Windows becomes visible on the streamer after upload and directory-cache refresh. Syncthing's Windows profile backup stays on the local SSD.
 
 ### On the NAS
 
@@ -229,30 +229,99 @@ Open a known FLAC from the Windows share and play the same file from `/mnt/nas` 
 
 [rclone NFS server documentation](https://rclone.org/commands/rclone_serve_nfs/)
 
-## Receive laptop projects on the shared SSD
+## Back up the Windows user profile with Syncthing
 
-Use the packaged Syncthing service under the Pi login. Give it a dependency on the SSD mount before enabling it.
+This is a **local-only backup**, separate from the Google Drive archive. The Windows Framework laptop runs Syncthing through **SyncTrayzor v2**; the Pi runs the Raspberry Pi OS `syncthing` package as `syncthing@pi.service`. The source is `C:\Users\David`; the Pi destination is `/mnt/nasdata/syncthing/dframe`. The Windows folder is **Send Only** and the Pi folder is **Receive Only**, with **Staggered File Versioning on the Pi**. The folder ID must be **identical** on both devices (the displayed folder label can differ).
+
+### Pi service and SSD dependency
+
+Install the package (also listed in the initial package-install command), prepare the destination **only after the SSD is mounted**, and make Syncthing depend on the SSD mount. Do not let a missing SSD silently redirect the backup onto the boot card.
 
 ```bash
-unit="syncthing@$(id -un).service"
-sudo mkdir -p "/etc/systemd/system/$unit.d"
-sudo tee "/etc/systemd/system/$unit.d/storage.conf" >/dev/null <<'EOF'
+sudo apt install syncthing
+mountpoint -q /mnt/nasdata || { echo "SSD not mounted"; exit 1; }
+sudo install -d -m 700 -o pi -g pi /mnt/nasdata/syncthing/dframe
+sudo mkdir -p /etc/systemd/system/syncthing@pi.service.d
+sudo tee /etc/systemd/system/syncthing@pi.service.d/storage.conf >/dev/null <<'EOF'
 [Unit]
 RequiresMountsFor=/mnt/nasdata
 ConditionPathIsMountPoint=/mnt/nasdata
 EOF
 sudo systemctl daemon-reload
-sudo systemctl enable --now "$unit"
+sudo systemctl enable --now syncthing@pi.service
+systemctl status syncthing@pi.service
 ```
 
-From the laptop, use `ssh -L 8385:127.0.0.1:8384 PI_LOGIN@nas` and open `http://localhost:8385` for the Pi's Syncthing interface. Pair the two devices. Share the laptop Projects folder as **Send Only**. Accept it on the Pi at `/mnt/nasdata/laptop-projects` as **Receive Only** and enable **Staggered File Versioning** there. Current files, retained versions and the rclone cache share the SSD’s free space. This folder is outside the Drive mount and Samba share.
+The override above is a **recommended recovery safeguard** from the original build instructions; verify it is installed on the running Pi with `systemctl cat syncthing@pi.service`. If the Pi login user is not `pi`, substitute the actual username in the commands and service name.
+
+### Pair devices and configure the folders
+
+1. On Windows, install and launch **SyncTrayzor v2** and open its Syncthing dashboard. Add the Windows profile folder `C:\Users\David` with a chosen folder ID, set **Folder Type = Send Only**, and enable **Watch for Changes**.
+2. On the Pi, open its Syncthing dashboard and pair the devices using their device IDs. Accept the shared folder using the **same folder ID**, set **Folder Path = /mnt/nasdata/syncthing/dframe**, **Folder Type = Receive Only**, and **File Versioning = Staggered File Versioning**.
+3. Configure version retention in the Pi dashboard to suit available disk space. Versioned files live under the destination's `.stversions` directory. Deleted files should disappear from the live destination but can be restored from version history (subject to retention and successful synchronization).
+4. Allow the initial scan and transfer to finish. Check **Up to Date** and **Out of Sync Items** on both devices. A 3600-second full rescan is normal: with filesystem watching enabled, ordinary changes usually propagate within seconds, without waiting for the hourly scan.
+
+### Windows ignore patterns
+
+Enter these under the Windows source folder's **Edit → Ignore Patterns**. This is the set configured during the build, not an automatically generated exclusion list. Syncthing's `(?d)` marker permits cleanup of ignored files on the receiving side. Review patterns if new folders or development workflows are added.
+
+```text
+(?d)AppData
+(?d)Downloads
+(?d)NTUSER.*
+(?d)ntuser.ini
+(?d)OneDrive
+(?d)Google Drive
+(?d).cache
+(?d)Application Data
+(?d)Local Settings
+(?d)Cookies
+(?d)NetHood
+(?d)PrintHood
+(?d)Recent
+(?d)SendTo
+(?d)Start Menu
+(?d)Templates
+(?d)**/node_modules
+(?d)**/.venv
+(?d)**/venv
+(?d)**/__pycache__
+(?d)**/.git/objects
+.codex/.codex-provisioning-*.guard
+```
+
+**Review `(?d)**/.git/objects` carefully:** it excludes local Git object history (including unpushed commits) from this backup. For a more complete developer backup, remove this exclusion and allow Git repositories to synchronize in full. Avoid adding broad exclusions for build directories if they might contain important originals.
+
+### LAN-only connections and dashboard
+
+On **both** Windows and Pi, under **Actions → Settings → Connections**, disable **Global Discovery**, **Relaying**, and **NAT Traversal**; leave **Local Discovery** enabled. Confirm the connected device uses a local IP and no relay address. Syncthing's device synchronization typically uses TCP/QUIC port **22000** and local discovery uses UDP **21027**. No router port forwarding is required.
+
+The Pi dashboard was initially accessed through an SSH tunnel:
+
+```bash
+ssh -L 8384:127.0.0.1:8384 pi@nas
+```
+
+Then browse `http://localhost:8384` on Windows. For the **LAN-accessible** dashboard, configure **Actions → Settings → GUI** on the Pi: bind the GUI to the Pi's LAN address (or `0.0.0.0:8384` if appropriately firewalled), set a strong GUI username/password, and enable HTTPS. Access it at `https://nas:8384` (a self-signed certificate warning is expected). Restrict port **8384** to trusted LAN clients; never forward it from the internet. The LAN GUI change was discussed during setup; confirm its exact bind, HTTPS and authentication settings on the Pi rather than assuming they are already active.
+
+### Recovery and operational checks
+
+```bash
+systemctl is-active syncthing@pi.service
+systemctl cat syncthing@pi.service
+findmnt --mountpoint /mnt/nasdata
+df -h /mnt/nasdata
+journalctl -u syncthing@pi.service -p warning --since "24 hours ago"
+```
+
+Create a small file under `C:\Users\David`, wait for it to appear in `/mnt/nasdata/syncthing/dframe`, then delete it on Windows. The live Pi copy should be deleted too, with a recoverable version in `.stversions` if versioning captured it. This create/delete/versioning flow was successfully tested during setup; test **restoration** separately. Syncthing is not an immutable or off-site backup: the Pi SSD holds the only version-history copy, and SSD failure can lose that history. After a reinstall, pair the new Syncthing device identity and verify folder paths and directions **before** enabling synchronization to avoid unwanted deletions.
 
 ## Verify and recover
 
 1. Reboot after configuring rclone to verify that the NVMe SSD mounts first and `pinas-rclone` starts automatically. Check both `/mnt/nasdata` and `/srv/nas` with `findmnt --mountpoint PATH` for each. Check `systemctl status pinas-rclone smbd "syncthing@$(id -un)"`.
 2. Write a small test file via Explorer. Confirm it appears in the intended folder in the Google Drive web interface after write-back. Open a Drive file through Samba to check reads.
-3. Create a test project file on the laptop, wait for Syncthing to report up to date, then edit it. Confirm the Pi has the new content and an older version is available.
+3. Create a test file in the Windows user profile, wait for Syncthing to report up to date, then edit it. Confirm the Pi has the new content and an older version is available.
 4. If rclone reports permission denied creating `/mnt/nasdata/rclone-cache`, first check the SSD mount and kernel log. On the USB test Pi, remounting the data disk resolved this symptom. Preserve the cache during recovery because writes may still be queued. Inspect `journalctl -u pinas-rclone -b` before restarting the service.
-5. After boot-device failure, restore Raspberry Pi OS, remount the surviving data partition, restore or reauthorise the remote, and recreate the services above. Restore the original login UID/GID or correct the projects directory ownership. A fresh Syncthing identity needs pairing again. After data-SSD failure, Drive can supply uploaded archive files and the laptop can supply current projects. Versions held solely on the failed SSD require a separate backup.
+5. After boot-device failure, restore Raspberry Pi OS, remount the surviving data partition, restore or reauthorise the remote, and recreate the services above. Restore the original login UID/GID or correct the Syncthing backup directory ownership. A fresh Syncthing identity needs pairing again. After data-SSD failure, Drive can supply uploaded archive files and the laptop can supply current Windows profile files. Versions held solely on the failed SSD require a separate backup.
 
 References: [rclone mount](https://rclone.org/commands/rclone_mount/), [Samba share settings](https://www.samba.org/samba/docs/current/man-html/smb.conf.5.html), [Syncthing versioning](https://docs.syncthing.net/users/versioning.html).
