@@ -1,10 +1,10 @@
 # Google Drive Pi NAS
 
-Build and recovery notes for Raspberry Pi OS Lite on a separate boot device and one data SSD. Run the shell commands in Bash as the Pi login user with sudo access. Examples use hostname `pinas`.
+Build and recovery notes for Raspberry Pi OS Lite on a separate boot device and one data SSD. Run the shell commands in Bash as the Pi login user with sudo access. Examples use hostname `nas`.
 
 | Purpose | Storage | Access |
 |---|---|---|
-| NAS archive | Existing Google Drive folder mounted at `/srv/nas` | Windows Samba share `\\pinas\nas` and read-only NFS at `/mnt/nas` on the streamer |
+| NAS archive | Existing Google Drive folder mounted at `/srv/nas` | Windows Samba share `\\nas\nas` and read-only NFS at `/mnt/nas` on the streamer |
 | rclone VFS cache | `/mnt/nasdata/rclone-cache` | Private to the Pi |
 | Laptop projects and retained versions | `/mnt/nasdata/laptop-projects` | Syncthing between laptop and Pi |
 
@@ -76,7 +76,7 @@ mountpoint -q /mnt/nasdata && sudo install -d -m 700 -o "$(id -un)" -g "$(id -gn
 
 ## Mount one fixed Google Drive folder
 
-This system service uses a root-owned config. Run `sudo -H rclone config`, add a Google Drive remote named `gdrive`, and complete authorisation. For a headless Pi, follow rclone's authorisation prompt on a machine with a browser. Keep the resulting config private. The example below assumes an existing folder named `NAS` in My Drive. Set the remote path and cache target before installing the service. Choose a cache target that leaves room for laptop projects and their version history. Open files and pending uploads can temporarily push the cache above its target. Check available space with `df -h /mnt/nasdata`.
+This system service uses a root-owned config. Run `sudo -H rclone config`, add a Google Drive remote named `gdrive`, and complete authorisation. On a headless Pi, answer **no** to browser-based authentication and run the exact `rclone authorize ...` command shown by the Pi in an existing Windows PowerShell session with rclone installed. Finish Google sign-in in the browser, then return to **PowerShell** for the JSON token printed between markers; paste the complete token at the Pi's `config_token>` prompt. If a separate console window closes too quickly, run the command directly in an existing PowerShell window rather than double-clicking a shortcut. Never commit the token, client secret or `rclone.conf` to Git. For a personal NAS containing ordinary files, consider the Drive advanced option `skip_gdocs = true` to hide Google-native Docs/Sheets/Slides from the filesystem without deleting them from Drive. Keep the resulting config private. The example below assumes an existing folder named `NAS` in My Drive. Set the remote path and cache target before installing the service. Choose a cache target that leaves room for laptop projects and their version history. Open files and pending uploads can temporarily push the cache above its target. Check available space with `df -h /mnt/nasdata`.
 
 ```bash
 sudo -H rclone lsf 'gdrive:NAS' --max-depth 1
@@ -88,7 +88,12 @@ DRIVE_PATH="gdrive:NAS"
 CACHE_LIMIT=250G
 ```
 
-Run this block as the login user who will access the Samba share. The shell inserts that user's numeric UID and GID into the unit. The service reads the two settings from the environment file at startup.
+Create a dedicated group for Samba access before installing the service. The Pi login user remains the filesystem owner; the `nasaccess` group grants the dedicated Samba account access. The shell inserts the login user's numeric UID and the group's numeric GID into the unit. The service reads the two settings from the environment file at startup.
+
+```bash
+sudo groupadd -f nasaccess
+NAS_GID=$(getent group nasaccess | cut -d: -f3)
+```
 
 ```bash
 sudo tee /etc/systemd/system/pinas-rclone.service >/dev/null <<EOF
@@ -103,7 +108,7 @@ ConditionPathIsMountPoint=/mnt/nasdata
 Type=notify
 Environment=HOME=/root
 EnvironmentFile=/etc/default/pinas-rclone
-ExecStart=/usr/bin/rclone mount \${DRIVE_PATH} /srv/nas --allow-other --uid $(id -u) --gid $(id -g) --umask 077 --cache-dir /mnt/nasdata/rclone-cache --vfs-cache-mode full --vfs-cache-max-size \${CACHE_LIMIT}
+ExecStart=/usr/bin/rclone mount \${DRIVE_PATH} /srv/nas --allow-other --uid $(id -u) --gid ${NAS_GID} --umask 007 --cache-dir /mnt/nasdata/rclone-cache --vfs-cache-mode full --vfs-cache-max-size \${CACHE_LIMIT}
 Restart=on-failure
 RestartSec=10
 
@@ -117,7 +122,18 @@ findmnt --mountpoint /srv/nas
 
 ## Share the archive with Windows
 
-Append this share to `/etc/samba/smb.conf`, substituting the actual Pi login for `PI_LOGIN`.
+Use a dedicated, non-login Samba account instead of exposing the Pi administrator's account. Samba passwords are separate from Linux passwords; set a **nonblank** password when prompted. The `nasaccess` group permits access to the rclone mount (which is owned by the Pi login user with group permissions `0770`).
+
+```bash
+sudo useradd --no-create-home --shell /usr/sbin/nologin nasuser
+sudo usermod -aG nasaccess nasuser
+sudo smbpasswd -a nasuser
+sudo smbpasswd -e nasuser
+id nasuser
+sudo -u nasuser ls /srv/nas
+```
+
+Append this share to `/etc/samba/smb.conf`:
 
 ```ini
 [nas]
@@ -125,15 +141,17 @@ Append this share to `/etc/samba/smb.conf`, substituting the actual Pi login for
     browseable = yes
     read only = no
     guest ok = no
-    valid users = PI_LOGIN
+    valid users = nasuser
+    force group = nasaccess
 ```
 
 ```bash
-sudo smbpasswd -a "$(id -un)"
-sudo testparm -s && sudo systemctl enable --now smbd && sudo systemctl reload smbd
+sudo testparm -s
+sudo systemctl enable --now smbd
+sudo systemctl restart smbd
 ```
 
-Open `\\pinas\nas` in Explorer and sign in with the Samba credentials. Use the Pi's LAN IP if hostname resolution is unavailable.
+Open `\\\\nas\\nas` in Windows Explorer and sign in as `nasuser` with its Samba password (use `nas\\nasuser` if Windows needs an explicit server-qualified username). Use the Pi's LAN IP if hostname resolution is unavailable. Create a small test file in the share's `Temp` folder and verify that it eventually appears in the Google Drive web interface. The apparent Windows write speed initially reflects the local NVMe cache; the file is not safely uploaded to Google Drive until rclone finishes write-back. Check `systemctl status pinas-rclone` for pending uploads. Do not discard the cache while uploads are pending.
 
 ## Read the same archive over NFS on the streamer
 
@@ -203,11 +221,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now "$unit"
 ```
 
-From the laptop, use `ssh -L 8385:127.0.0.1:8384 PI_LOGIN@pinas` and open `http://localhost:8385` for the Pi's Syncthing interface. Pair the two devices. Share the laptop Projects folder as **Send Only**. Accept it on the Pi at `/mnt/nasdata/laptop-projects` as **Receive Only** and enable **Staggered File Versioning** there. Current files, retained versions and the rclone cache share the SSD’s free space. This folder is outside the Drive mount and Samba share.
+From the laptop, use `ssh -L 8385:127.0.0.1:8384 PI_LOGIN@nas` and open `http://localhost:8385` for the Pi's Syncthing interface. Pair the two devices. Share the laptop Projects folder as **Send Only**. Accept it on the Pi at `/mnt/nasdata/laptop-projects` as **Receive Only** and enable **Staggered File Versioning** there. Current files, retained versions and the rclone cache share the SSD’s free space. This folder is outside the Drive mount and Samba share.
 
 ## Verify and recover
 
-1. After reboot, check both `/mnt/nasdata` and `/srv/nas` with `findmnt --mountpoint PATH` for each. Check `systemctl status pinas-rclone smbd "syncthing@$(id -un)"`.
+1. Reboot after configuring rclone to verify that the NVMe SSD mounts first and `pinas-rclone` starts automatically. Check both `/mnt/nasdata` and `/srv/nas` with `findmnt --mountpoint PATH` for each. Check `systemctl status pinas-rclone smbd "syncthing@$(id -un)"`.
 2. Write a small test file via Explorer. Confirm it appears in the intended folder in the Google Drive web interface after write-back. Open a Drive file through Samba to check reads.
 3. Create a test project file on the laptop, wait for Syncthing to report up to date, then edit it. Confirm the Pi has the new content and an older version is available.
 4. If rclone reports permission denied creating `/mnt/nasdata/rclone-cache`, first check the SSD mount and kernel log. On the USB test Pi, remounting the data disk resolved this symptom. Preserve the cache during recovery because writes may still be queued. Inspect `journalctl -u pinas-rclone -b` before restarting the service.
