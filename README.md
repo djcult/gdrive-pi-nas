@@ -153,6 +153,30 @@ sudo systemctl restart smbd
 
 Open `\\\\nas\\nas` in Windows Explorer and sign in as `nasuser` with its Samba password (use `nas\\nasuser` if Windows needs an explicit server-qualified username). Use the Pi's LAN IP if hostname resolution is unavailable. Create a small test file in the share's `Temp` folder and verify that it eventually appears in the Google Drive web interface. The apparent Windows write speed initially reflects the local NVMe cache; the file is not safely uploaded to Google Drive until rclone finishes write-back. Check `systemctl status pinas-rclone` for pending uploads. Do not discard the cache while uploads are pending.
 
+## Windows personal Google Drive letter (optional)
+
+On the Windows PC, Google Drive for desktop mounts the full Drive as **H:**. To keep the `NAS` and other sibling folders out of the everyday view, use a separate **G:** letter pointing to `H:\My Drive\David`. This is a view of the same files, not a copy or another sync. The Pi's Samba share remains `\\nas\nas`.
+
+1. Save [`windows/GoogleDrive-G-Mapping.ps1`](windows/GoogleDrive-G-Mapping.ps1) to a permanent local path, e.g. `C:\Users\david\Scripts\GoogleDrive-G-Mapping.ps1`. Change `$source` if the Google Drive folder or drive letter differs.
+2. In **Task Scheduler**, choose **Create Task** (not Basic Task). Name it **Google Drive Personal Mapping**. Use **Run only when user is logged on**, without **Run with highest privileges**.
+3. Add an **At log on** trigger for the Windows account. Add a **Start a program** action with program `powershell.exe` and arguments:
+
+   ```text
+   -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Users\david\Scripts\GoogleDrive-G-Mapping.ps1"
+   ```
+
+4. Optionally disable the AC-power-only condition. The script waits up to five minutes for `H:\My Drive\David`, then maps G: without overwriting another mapping. Check `%LOCALAPPDATA%\GoogleDrive-G-Mapping.log` for success/errors.
+5. To **hide H: from This PC** (cosmetic only), open PowerShell **as Administrator, in the same Windows account**, and run this one-line command:
+
+   ```powershell
+   reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" /v NoDrives /t REG_DWORD /d 128 /f
+   ```
+
+   Value `128` (hex `0x80`) hides drive H. **Caution:** this overwrites any existing `NoDrives` bitmask; inspect and combine values first if other drives are already hidden. The policy is persistent and does **not** need to be set by the logon script. H: remains accessible by path; this is not an access-control measure. The alternative `HKCU\...\CurrentVersion\Explorer` location did not hide the drive in this setup.
+6. **Sign out and back in**. Google Drive may take ~30 seconds to mount H: and for the script to create G:. Verify G: opens the David folder and H: does not appear in **This PC**. Google Drive's own navigation entry may still be shown separately.
+
+To undo: run `subst G: /D`, disable or delete the scheduled task, and remove the `NoDrives` value with `reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" /v NoDrives /f` **only if that value was dedicated to hiding H:**. Sign out and back in to refresh Explorer.
+
 ## Read the same archive over NFS on the streamer
 
 Samba writes to the Drive folder configured by `DRIVE_PATH`. A second rclone service reads that same remote for playback. A file added through Windows becomes visible on the streamer after upload and directory-cache refresh. Syncthing projects stay on the local SSD.
