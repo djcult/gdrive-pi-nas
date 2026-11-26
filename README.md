@@ -6,6 +6,7 @@ Build and recovery notes for Raspberry Pi OS Lite on a separate boot device and 
 |---|---|---|
 | NAS archive | Existing Google Drive folder mounted at `/srv/nas` | Windows Samba share `\\nas\nas` and read-only NFS at `/mnt/nas` on the streamer |
 | rclone VFS cache | `/mnt/nasdata/rclone-cache` | Private to the Pi |
+| Streamer backup | `/mnt/nasdata/pi-backups/streamer` | Read/write NFSv4 export restricted to the streamer |
 | Windows profile backup and retained versions | `/mnt/nasdata/syncthing/dframe` | Syncthing from Windows (Send Only) to Pi (Receive Only), LAN only |
 
 The archive streams from Drive. The cache holds recently accessed data and can temporarily hold the only copy of pending uploads.
@@ -16,7 +17,7 @@ Install Raspberry Pi OS on the boot device first. Set the hostname and create th
 
 ```bash
 sudo apt update
-sudo apt install parted e2fsprogs rclone fuse3 samba syncthing
+sudo apt install parted e2fsprogs rclone fuse3 samba syncthing nfs-kernel-server
 lsblk -o NAME,PATH,TYPE,SIZE,MODEL,SERIAL,FSTYPE,MOUNTPOINTS
 findmnt /
 ```
@@ -177,9 +178,13 @@ On the Windows PC, Google Drive for desktop mounts the full Drive as **H:**. To 
 
 To undo: run `subst G: /D`, disable or delete the scheduled task, and remove the `NoDrives` value with `reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" /v NoDrives /f` **only if that value was dedicated to hiding H:**. Sign out and back in to refresh Explorer.
 
-## Read the same archive over NFS on the streamer
+## NFS access from the streamer
 
 Samba writes to the Drive folder configured by `DRIVE_PATH`. A second rclone service reads that same remote for playback. A file added through Windows becomes visible on the streamer after upload and directory-cache refresh. Syncthing's Windows profile backup stays on the local SSD.
+
+### Google Drive music archive (read-only)
+
+The NAS serves the Google Drive archive to the streamer through rclone's NFSv3 server. This keeps the existing read-only music path and its rclone cache behavior separate from the local backup export below.
 
 ### On the NAS
 
@@ -228,6 +233,60 @@ findmnt --mountpoint /mnt/nas --types nfs
 Open a known FLAC from the Windows share and play the same file from `/mnt/nas` on the streamer. If restarting the NFS service produces a stale file handle, close playback, leave the mount directory and run `sudo systemctl restart mnt-nas.mount` on the streamer.
 
 [rclone NFS server documentation](https://rclone.org/commands/rclone_serve_nfs/)
+
+### Local streamer backup folder (read/write)
+
+The streamer backup is stored on the NAS's ext4 SSD, outside the Google Drive mount and its VFS cache. Reserve a fixed LAN IP for the streamer. NFS has no user authentication, so restrict the export to that IP. The export maps all requests from the streamer to the streamer's numeric UID/GID; this lets root-run backup jobs write archive files while keeping the directory private to that client. For a metadata-preserving system backup, write a tar archive to this mount rather than copying a tree with NFS ownership changes.
+
+#### On the NAS
+
+On the streamer, get its numeric IDs with `id -u` and `id -g`. Replace the three placeholders below with the streamer's reserved LAN IP, UID, and GID. The directory owner and NFS anonymous IDs must match.
+
+```bash
+sudo install -d -m 700 -o STREAMER_UID -g STREAMER_GID /mnt/nasdata/pi-backups/streamer
+sudoedit /etc/exports
+```
+
+Add this one line to `/etc/exports`:
+
+```exports
+/mnt/nasdata/pi-backups/streamer STREAMER_LAN_IP(rw,sync,no_subtree_check,fsid=0,all_squash,anonuid=STREAMER_UID,anongid=STREAMER_GID)
+```
+
+Then enable the NFS server and load the export:
+
+```bash
+sudo systemctl enable --now nfs-kernel-server
+sudo exportfs -rav
+sudo exportfs -v
+```
+
+#### On the streamer
+
+Install the NFS client and add the mount to `/etc/fstab`, replacing `NAS_LAN_IP` with the NAS's reserved LAN IP:
+
+```bash
+sudo apt install nfs-common
+sudo mkdir -p /mnt/nas-backup
+sudoedit /etc/fstab
+```
+
+```fstab
+NAS_LAN_IP:/ /mnt/nas-backup nfs4 rw,vers=4.2,proto=tcp,_netdev,nofail,x-systemd.automount 0 0
+```
+
+Load and verify the mount, then do a small write test:
+
+```bash
+sudo systemctl daemon-reload
+sudo mount -a
+findmnt --mountpoint /mnt/nas-backup --types nfs4
+touch /mnt/nas-backup/test-from-streamer
+ls -l /mnt/nas-backup
+sudo rm /mnt/nas-backup/test-from-streamer
+```
+
+The streamer backup destination is `/mnt/nas-backup`; files written there land in `/mnt/nasdata/pi-backups/streamer` on the NAS SSD. Keep the backup job's output as archive files so the archive retains source ownership and permissions.
 
 ## Back up the Windows user profile with Syncthing
 
