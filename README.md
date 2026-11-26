@@ -279,7 +279,8 @@ Load and verify the mount, then do a small write test:
 
 ```bash
 sudo systemctl daemon-reload
-sudo mount -a
+sudo systemctl start "$(systemd-escape --path --suffix=automount /mnt/nas-backup)"
+ls /mnt/nas-backup
 findmnt --mountpoint /mnt/nas-backup --types nfs4
 touch /mnt/nas-backup/test-from-streamer
 ls -l /mnt/nas-backup
